@@ -1,12 +1,11 @@
 """Run: python app.py [--demo]."""
-import json
 import os
 from pathlib import Path
 import sys
 from datetime import date, datetime, timedelta
 
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QStandardPaths
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QIcon
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QLineEdit, QTableWidget, QTableWidgetItem, QHeaderView,
@@ -14,6 +13,7 @@ from PySide6.QtWidgets import (
     QFrame, QProgressBar,
 )
 from core import ZabbixApi, ApiError, classify, normalize_url
+from settings import SettingsError, read_settings, write_settings
 
 
 COLORS = {
@@ -136,12 +136,12 @@ class Window(QMainWindow):
         self.setWindowTitle("Zabbix · Контроль обновлений" + (" · ДЕМО" if demo else ""))
         self.resize(1180, 780)
         self.config_path = Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppConfigLocation)) / "settings.json"
+        self.settings_error = ""
         try:
-            config = json.loads(self.config_path.read_text(encoding="utf-8"))
-            if not isinstance(config, dict):
-                config = {}
-        except (OSError, ValueError):
-            config = {}
+            config, saved_token = read_settings(self.config_path) if not demo else ({}, "")
+        except SettingsError as exc:
+            config, saved_token = {}, ""
+            self.settings_error = str(exc)
         ids = config.get("hostids")
         self.selected = set(map(str, ids)) if isinstance(ids, list) else None
         self.selection_url = config.get("url", "")
@@ -158,7 +158,13 @@ class Window(QMainWindow):
         form.addWidget(QLabel("ПОДКЛЮЧЕНИЕ К ZABBIX"))
         fields = QHBoxLayout()
         self.url = QLineEdit(os.getenv("ZABBIX_URL", str(config.get("url", ""))), placeholderText="https://zabbix.example.com/zabbix")
-        self.token = QLineEdit(os.getenv("ZABBIX_API_TOKEN", ""), placeholderText="API-токен (не сохраняется на диск)")
+        try:
+            if normalize_url(self.url.text()) != normalize_url(str(config.get("url", ""))):
+                saved_token = ""
+        except ApiError:
+            saved_token = ""
+        self.token = QLineEdit(os.getenv("ZABBIX_API_TOKEN", saved_token), placeholderText="API-токен (защищён Windows)")
+        self.token.textEdited.connect(self.clear_settings_error)
         self.token.setEchoMode(QLineEdit.EchoMode.Password)
         fields.addWidget(self.url, 3)
         fields.addWidget(self.token, 2)
@@ -215,17 +221,27 @@ class Window(QMainWindow):
         if self.demo or (self.url.text().strip() and self.token.text().strip()):
             self.load()
         else:
-            self.status.setText("Введите адрес Zabbix и API-токен, затем нажмите «Обновить». При следующих запусках с токеном в ZABBIX_API_TOKEN данные загрузятся автоматически.")
+            self.status.setText(self.settings_error or "Введите адрес Zabbix и API-токен, затем нажмите «Обновить». Подключение сохранится, при следующем запуске данные загрузятся автоматически.")
+
+    def clear_settings_error(self, text):
+        self.settings_error = ""
 
     def save_config(self):
         if self.demo:
             return
+        if self.settings_error and not self.token.text().strip():
+            # Do not erase an unreadable token merely by closing the window.
+            return
         try:
-            self.config_path.parent.mkdir(parents=True, exist_ok=True)
-            self.config_path.write_text(json.dumps({"url": self.selection_url,
-                "hostids": sorted(self.selected) if self.selected is not None else None}, ensure_ascii=False, indent=2), encoding="utf-8")
-        except OSError:
-            self.status.setText(self.status.text() + " Не удалось сохранить настройки.")
+            url = normalize_url(self.url.text()) if self.url.text().strip() else ""
+        except ApiError:
+            self.status.setText(self.status.text() + " Настройки не сохранены: некорректный адрес Zabbix.")
+            return
+        try:
+            write_settings(self.config_path, {"url": url,
+                "hostids": sorted(self.selected) if self.selected is not None and url == self.selection_url else None}, self.token.text().strip())
+        except SettingsError as exc:
+            self.status.setText(self.status.text() + " " + str(exc))
 
     def load(self):
         if self.worker is not None:
@@ -250,6 +266,7 @@ class Window(QMainWindow):
         self.token.setEnabled(False)
         self.progress.show()
         self.status.setText("Загрузка из Zabbix… Ранее загруженные данные пока остаются в таблице.")
+        self.save_config()
         self.worker = FetchThread(self.url.text(), self.token.text(), self.selected, self.demo)
         self.worker.ready.connect(self.loaded)
         self.worker.failed.connect(self.failed)
@@ -346,13 +363,18 @@ class Window(QMainWindow):
             self.status.setText("Дождитесь завершения запроса перед закрытием окна (тайм-аут одного запроса — 20 секунд).")
             event.ignore()
         else:
+            self.save_config()
             event.accept()
 
 
 if __name__ == "__main__":
+    if sys.platform == "win32":
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ServerTools.ZabbixUpdateMonitor")
     app = QApplication(sys.argv)
     app.setOrganizationName("ServerTools")
     app.setApplicationName("ZabbixUpdateMonitor")
+    app.setWindowIcon(QIcon(str(Path(__file__).resolve().parent / "assets" / "app.ico")))
     app.setStyle("Fusion")
     app.setStyleSheet(STYLE)
     window = Window(demo="--demo" in sys.argv)
